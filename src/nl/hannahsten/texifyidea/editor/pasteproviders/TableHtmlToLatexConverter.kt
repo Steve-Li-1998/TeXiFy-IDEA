@@ -27,30 +27,62 @@ class TableHtmlToLatexConverter : HtmlToLatexConverter {
      */
     @Suppress("USELESS_CAST")
     private fun Document.toTableDialogWrapper(latexFile: LatexFile): TableCreationDialogWrapper? {
+        // 1) 获取所有行
         val rows = select("table tr")
-        val height = rows.size
-        val width = rows.firstOrNull()?.select("td, th")?.size ?: 0
+        if (rows.isEmpty()) return null
 
-        if (height == 0 && width == 0) return null
+        // 2) 识别表头行：优先 <thead>，其次含 <th>，再者含 colspan/rowspan，最后 fallback 第一行
+        val theadRows = select("table thead tr")
+        val headerRows = when {
+            theadRows.isNotEmpty() -> theadRows
+            rows.any { it.select("th").isNotEmpty() } -> rows.filter { it.select("th").isNotEmpty() }
+            rows.any { it.select("td,th").any { cell -> cell.hasAttr("colspan") || cell.hasAttr("rowspan") } } ->
+                rows.filter { it.select("td,th").any { cell -> cell.hasAttr("colspan") || cell.hasAttr("rowspan") } }
+            else -> listOf(rows.first())
+        }
+        val dataRows = rows - headerRows.toSet()
+        if (dataRows.isEmpty()) return null
 
-        // Convert html to data vector Vector<Vector<Any?>> as required by DefaultTableModel
-        val header = rows.firstOrNull()?.select("td, th")?.mapNotNull { it.text() }?.toVector() ?: return null
-        val content: Vector<Vector<Any?>> = rows.drop(1).map { tr ->
-            tr.select("td, th").map { td -> convertHtmlToLatex(listOf(td), latexFile) as Any? }.toVector()
+        // 3) 展开多行表头为单行：按 colspan 构建矩阵并汇总
+        fun expandHeader(headers: List<Element>): List<String> {
+            data class H(val text: String, val colspan: Int)
+            val mat = mutableListOf<MutableList<H?>>()
+
+            headers.forEachIndexed { r, tr ->
+                if (mat.size <= r) mat.add(mutableListOf())
+                val rowList = mat[r]
+                var c = 0
+                tr.select("td, th").forEach { th ->
+                    while (rowList.size > c && rowList[c] != null) c++
+                    val span = th.attr("colspan").toIntOrNull() ?: 1
+                    val cell = H(th.text(), span)
+                    for (dc in 0 until span) {
+                        while (rowList.size <= c + dc) rowList.add(null)
+                        rowList[c + dc] = if (dc == 0) cell else H("", 1)
+                    }
+                    c += span
+                }
+            }
+            val cols = mat.maxOf { it.size }
+            return (0 until cols).map { col ->
+                mat.joinToString(" \\\\ ") { row -> row.getOrNull(col)?.text.orEmpty() }
+            }
+        }
+        val header = expandHeader(headerRows.filterNotNull()).toVector()
+
+        // 4) 转换数据行
+        val content: Vector<Vector<Any?>> = dataRows.map { tr ->
+            tr?.select("td, th")?.map { td -> convertHtmlToLatex(listOf(td), latexFile) as Any? }?.toVector()
         }.toVector()
 
-        // Find the type of column automatically.
-        val contentRows = rows.drop(1)
-        val columnTypes = (0 until width).map { col ->
-            // Check if all contents of the column (except the header) can be converted to a number.
-            // When that's the case => it's a number column. All other cases, text. Ignoring the Math option
-            // as the table information is most probably something outside of a latex context.
-            if (contentRows.all { it.select("td, th").getOrNull(col)?.text()?.toDoubleOrNull() != null }) {
+        // 5) 推断列类型
+        val columnTypes = (0 until header.size).map { col ->
+            if (dataRows.all { it?.select("td, th")?.getOrNull(col)?.text()?.toDoubleOrNull() != null }) {
                 ColumnType.NUMBERS_COLUMN
-            }
-            else ColumnType.TEXT_COLUMN
+            } else ColumnType.TEXT_COLUMN
         }
 
+        // 6) 返回向导包装
         return TableCreationDialogWrapper(
             columnTypes,
             TableCreationTableModel(content, header)
